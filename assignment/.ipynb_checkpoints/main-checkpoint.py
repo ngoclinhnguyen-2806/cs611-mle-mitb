@@ -67,7 +67,7 @@ print("\n" + "="*80)
 print("BRONZE LAYER PROCESSING")
 print("="*80)
 
-bronze_directory = "/apps/datamart/bronze/"
+bronze_directory = "/app/datamart/bronze/"
 
 if not os.path.exists(bronze_directory):
     os.makedirs(bronze_directory)
@@ -83,28 +83,29 @@ for date_str in dates_str_lst:
 print("\n✓ Bronze layer backfill completed for all tables\n")
 
 # =============================================================================
-# SILVER LAYER - Process loan data
+# SILVER LAYER - Process all tables (loan, clickstream, attributes, financials)
 # =============================================================================
 print("\n" + "="*80)
 print("SILVER LAYER PROCESSING")
 print("="*80)
 
-silver_loan_daily_directory = "/app/datamart/silver/loan_daily/"
+silver_directory = "/app/datamart/silver/"
 
-if not os.path.exists(silver_loan_daily_directory):
-    os.makedirs(silver_loan_daily_directory)
+if not os.path.exists(silver_directory):
+    os.makedirs(silver_directory)
 
-# run silver backfill
-bronze_lms_directory = os.path.join(bronze_directory, "lms_loan_daily/")
+# run silver backfill for all tables
 for date_str in dates_str_lst:
+    # Process all tables at once (table_name=None means process all)
     utils.data_processing_silver_table.process_silver_table(
         date_str, 
-        bronze_lms_directory, 
-        silver_loan_daily_directory, 
-        spark
+        bronze_directory,  # Updated: now uses bronze_directory as base path
+        silver_directory,   # Updated: now uses silver_directory as base path
+        spark,
+        table_name=None    # Process all tables
     )
 
-print("\n✓ Silver layer backfill completed\n")
+print("\n✓ Silver layer backfill completed for all tables\n")
 
 # =============================================================================
 # GOLD LAYER - Create label store
@@ -118,7 +119,9 @@ gold_label_store_directory = "/app/datamart/gold/label_store/"
 if not os.path.exists(gold_label_store_directory):
     os.makedirs(gold_label_store_directory)
 
-# run gold backfill
+# run gold backfill - uses silver loan_daily table
+silver_loan_daily_directory = os.path.join(silver_directory, "loan_daily/")
+
 for date_str in dates_str_lst:
     utils.data_processing_gold_table.process_labels_gold_table(
         date_str, 
@@ -140,7 +143,7 @@ print("="*80)
 
 # Check Bronze layer
 print("\nBronze Layer Tables:")
-for table_name in ['lms_loan_daily', 'features_clickstream', 'features_attributes', 'features_financials']:
+for table_name in ['lms_loan_daily', 'feature_clickstream', 'features_attributes', 'features_financials']:
     table_path = os.path.join(bronze_directory, table_name)
     if os.path.exists(table_path):
         file_count = len(glob.glob(os.path.join(table_path, '*.csv')))
@@ -148,11 +151,25 @@ for table_name in ['lms_loan_daily', 'features_clickstream', 'features_attribute
     else:
         print(f"  {table_name}: NOT FOUND")
 
-# Check Silver layer
-print("\nSilver Layer:")
-if os.path.exists(silver_loan_daily_directory):
-    file_count = len(glob.glob(os.path.join(silver_loan_daily_directory, '*.csv')))
-    print(f"  loan_daily: {file_count} partitions")
+# Check Silver layer - All tables
+print("\nSilver Layer Tables:")
+for table_name in ['loan_daily', 'feature_clickstream', 'features_attributes', 'features_financials']:
+    table_path = os.path.join(silver_directory, table_name)
+    if os.path.exists(table_path):
+        # Count parquet files (silver layer uses parquet format)
+        file_count = len(glob.glob(os.path.join(table_path, '*.parquet')))
+        print(f"  {table_name}: {file_count} partitions")
+        
+        # Show sample data for first available file
+        parquet_files = glob.glob(os.path.join(table_path, '*.parquet'))
+        if parquet_files:
+            try:
+                df = spark.read.parquet(parquet_files[0])
+                print(f"    - Sample partition row count: {df.count()}")
+            except Exception as e:
+                print(f"    - Error reading sample: {str(e)}")
+    else:
+        print(f"  {table_name}: NOT FOUND")
 
 # Check Gold layer - Label Store
 print("\nGold Layer - Label Store:")

@@ -33,10 +33,10 @@ def process_bronze_table(snapshot_date_str, bronze_directory, spark, table_name)
     
     # Define source file mapping
     source_file_mapping = {
-        'lms_loan_daily': '/app/data/lms_loan_daily.csv',
-        'features_clickstream': '/app/data/feature_clickstream.csv',
-        'features_attributes': '/app/data/features_attributes.csv',
-        'features_financials': '/app/data/features_financials.csv'
+        'lms_loan_daily': 'data/lms_loan_daily.csv',
+        'feature_clickstream': 'data/feature_clickstream.csv',
+        'features_attributes': 'data/features_attributes.csv',
+        'features_financials': 'data/features_financials.csv'
     }
     
     # Get the source file path
@@ -88,7 +88,7 @@ def process_all_bronze_tables(snapshot_date_str, bronze_directory, spark):
     """
     table_names = [
         'lms_loan_daily',
-        'features_clickstream', 
+        'feature_clickstream', 
         'features_attributes',
         'features_financials'
     ]

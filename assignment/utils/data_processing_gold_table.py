@@ -84,7 +84,7 @@ def process_feature_store_gold_table(snapshot_date_str, silver_directory, gold_f
     
     print(f"Gold feature store directory ready")
     print(f"Note: Feature store processing logic to be implemented in future iterations")
-    print(f"      Will combine: features_clickstream, features_attributes, features_financials")
+    print(f"      Will combine: feature_clickstream, features_attributes, features_financials")
     
     return None
 

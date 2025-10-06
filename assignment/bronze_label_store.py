@@ -96,7 +96,7 @@ if __name__ == "__main__":
         type=str,
         required=False,
         default=None,
-        help="Comma-separated list of tables to process (e.g., 'lms_loan_daily,features_clickstream'). If not provided, all tables will be processed."
+        help="Comma-separated list of tables to process (e.g., 'lms_loan_daily,feature_clickstream'). If not provided, all tables will be processed."
     )
     
     args = parser.parse_args()
