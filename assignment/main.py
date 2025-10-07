@@ -19,10 +19,17 @@ import utils.data_processing_gold_table
 
 
 # Initialize SparkSession
-spark = pyspark.sql.SparkSession.builder \
-    .appName("dev") \
-    .master("local[*]") \
-    .getOrCreate()
+spark = (
+    pyspark.sql.SparkSession.builder
+        .appName("dev")
+        .master("local[*]")                   # keep local mode
+        .config("spark.driver.memory", "8g")  # ↑ give the driver more heap (try 4g, 6g, 8g)
+        .config("spark.driver.maxResultSize", "2g")  # protect against huge collects
+        .config("spark.sql.shuffle.partitions", "16") # fewer shuffles for local runs
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
+        # .config("spark.executor.memory", "6g")      # optional; mainly for cluster mode
+        .getOrCreate()
+)
 
 # Set log level to ERROR to hide warnings
 spark.sparkContext.setLogLevel("ERROR")
@@ -31,7 +38,7 @@ spark.sparkContext.setLogLevel("ERROR")
 snapshot_date_str = "2023-01-01"
 
 start_date_str = "2023-01-01"
-end_date_str = "2024-12-01"
+end_date_str = "2024-12-01" # will change later
 
 # generate list of dates to process
 def generate_first_of_month_dates(start_date_str, end_date_str):
@@ -108,31 +115,27 @@ for date_str in dates_str_lst:
 print("\n✓ Silver layer backfill completed for all tables\n")
 
 # =============================================================================
-# GOLD LAYER - Create label store
+# GOLD LAYER - Create Feature Store (with labels)
 # =============================================================================
 print("\n" + "="*80)
-print("GOLD LAYER PROCESSING - LABEL STORE")
+print("GOLD LAYER PROCESSING - FEATURE STORE")
 print("="*80)
 
-gold_label_store_directory = "/app/datamart/gold/label_store/"
+gold_feature_store_directory = "/app/datamart/gold/feature_store/"
 
-if not os.path.exists(gold_label_store_directory):
-    os.makedirs(gold_label_store_directory)
+if not os.path.exists(gold_feature_store_directory):
+    os.makedirs(gold_feature_store_directory)
 
-# run gold backfill - uses silver loan_daily table
-silver_loan_daily_directory = os.path.join(silver_directory, "loan_daily/")
-
+# run gold backfill - creates comprehensive feature store
 for date_str in dates_str_lst:
-    utils.data_processing_gold_table.process_labels_gold_table(
+    utils.data_processing_gold_table.process_gold_feature_store(
         date_str, 
-        silver_loan_daily_directory, 
-        gold_label_store_directory, 
-        spark, 
-        dpd=30,  # Days Past Due threshold
-        mob=6    # Months on Book threshold
+        silver_directory,  # Base silver directory (contains all tables)
+        gold_feature_store_directory, 
+        spark
     )
 
-print("\n✓ Gold layer label store backfill completed\n")
+print("\n✓ Gold layer feature store backfill completed\n")
 
 # =============================================================================
 # VERIFY RESULTS
@@ -171,21 +174,33 @@ for table_name in ['loan_daily', 'feature_clickstream', 'features_attributes', '
     else:
         print(f"  {table_name}: NOT FOUND")
 
-# Check Gold layer - Label Store
-print("\nGold Layer - Label Store:")
-folder_path = gold_label_store_directory
+# Check Gold layer - Feature Store
+print("\nGold Layer - Feature Store:")
+folder_path = gold_feature_store_directory
 files_list = [os.path.join(folder_path, os.path.basename(f)) 
-              for f in glob.glob(os.path.join(folder_path, '*'))]
+              for f in glob.glob(os.path.join(folder_path, '*.parquet'))]
 
 if files_list:
-    df = spark.read.option("header", "true").parquet(*files_list)
+    df = spark.read.parquet(*files_list)
     print(f"  Total row count: {df.count()}")
-    print(f"  Schema:")
-    df.printSchema()
+    print(f"  Total features: {len(df.columns)}")
+    
+    # Show default rate
+    if "default_label" in df.columns:
+        default_count = df.filter(col("default_label") == 1).count()
+        total_count = df.count()
+        default_rate = (default_count / total_count * 100) if total_count > 0 else 0
+        print(f"  Default rate: {default_rate:.2f}% ({default_count}/{total_count})")
+    
+    print(f"\n  Schema preview (first 20 columns):")
+    for field in df.schema.fields[:20]:
+        print(f"    - {field.name}: {field.dataType}")
+    
     print(f"\n  Sample data:")
-    df.show(10)
+    df.select("loan_id", "Customer_ID", "application_date", "loan_amt", 
+              "age_clean", "Annual_Income", "DTI", "default_label").show(10)
 else:
-    print("  No data found in label store")
+    print("No data found in feature store")
 
 print("\n" + "="*80)
 print("PIPELINE EXECUTION COMPLETED")

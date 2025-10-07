@@ -6,15 +6,16 @@ from dateutil.relativedelta import relativedelta
 
 # --- PySpark core & types ---
 from pyspark.sql import functions as F
+from pyspark.sql import Window
 from pyspark.sql.functions import col, regexp_replace, trim, when
-from pyspark.sql.types import StringType, IntegerType, FloatType, DoubleType, DateType
+from pyspark.sql.types import StringType, IntegerType, FloatType, DoubleType, DateType, DecimalType
 
 # --- CLI utilities (if you use them elsewhere) ---
 import argparse
 
-# -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
+# =============================================================================
+# LOGGING
+# =============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -22,7 +23,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# BASIC VALIDATION (kept)
+# BASIC VALIDATION
 # =============================================================================
 def validate_customer_ids(df, table_name):
     """
@@ -39,6 +40,17 @@ def validate_customer_ids(df, table_name):
 
     unique_customers = df.select("Customer_ID").distinct().count()
     logger.info(f"{table_name}: {unique_customers} unique customers")
+
+
+def dedup_on(df, keys, order_cols=None):
+    """
+    Keep the latest row per key. If order_cols provided, prefer the newest
+    (DESC, NULLS LAST); otherwise simple dropDuplicates(keys).
+    """
+    if order_cols:
+        w = Window.partitionBy(*keys).orderBy(*[F.col(c).desc_nulls_last() for c in order_cols])
+        return df.withColumn("__rn", F.row_number().over(w)).filter(F.col("__rn")==1).drop("__rn")
+    return df.dropDuplicates(keys)
 
 # =============================================================================
 # HELPERS
@@ -101,7 +113,7 @@ def save_silver_table(df, snapshot_date_str, silver_directory, table_name):
 
 def cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date"), numeric_threshold=0.9):
     """
-    Auto-detect numeric-looking string columns, clean, and cast to Integer/Float.
+    Auto-detect numeric-looking string columns, clean, and cast to Integer/Double.
     """
     try:
         string_cols = [f.name for f in df.schema.fields if isinstance(f.dataType, StringType)]
@@ -125,12 +137,12 @@ def cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date"), numeric_thresh
                 ).collect()[0]["max_frac"]
 
                 is_integer = (max_frac is None) or (float(max_frac) == 0.0)
-                target_type = IntegerType() if is_integer else FloatType()
+                target_type = IntegerType() if is_integer else DoubleType()
 
                 df = df_with.drop(c).withColumn(c, col(tmp).cast(target_type)).drop(tmp)
                 logger.info(
                     "Auto-cast '%s' -> %s (cleaned non-numeric chars)",
-                    c, "Integer" if is_integer else "Float"
+                    c, "Integer" if is_integer else "Double"
                 )
             else:
                 logger.info(
@@ -143,18 +155,31 @@ def cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date"), numeric_thresh
         logger.error(f"Error in transformation: {str(e)}")
         raise
 
+
+def upcast_floats_to_double(df):
+    for f in df.schema.fields:
+        if isinstance(f.dataType, (FloatType, DecimalType)):
+            df = df.withColumn(f.name, col(f.name).cast(DoubleType()))
+    return df
+        
 # =============================================================================
 # TRANSFORMATIONS
 # =============================================================================
 
 def transform_clickstream(df):
-    """
-    Clickstream: apply generic numeric cleaning/casting across columns.
-    """
     try:
-        # sweep numeric-like strings (keep id/date as-is)
+        # numeric sweep (protect ID/date)
         df = cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date"))
-        logger.info("Clickstream transformations: cast_to_numeric applied.")
+
+        # as-of date for leakage control
+        if "snapshot_date" in df.columns:
+            df = df.withColumn("asof_date", col("snapshot_date"))
+
+        # deduplicate at grain: Customer_ID + snapshot_date (prefer updated_at if present)
+        keys = ["Customer_ID", "snapshot_date"]
+        order_cols = [c for c in ["updated_at", "snapshot_date"] if c in df.columns]
+        df = dedup_on(df, keys, order_cols=order_cols if order_cols else None)
+
         return df
     except Exception as e:
         logger.error(f"Error in clickstream transformation: {str(e)}")
@@ -162,47 +187,49 @@ def transform_clickstream(df):
 
 
 def transform_attributes(df):
-    """
-    Attributes: drop any PII if present, then numeric sweep.
-    """
     try:
-        # optional PII pruning first
+        # optional PII removal
         pii_cols = [c for c in ["SSN", "Name"] if c in df.columns]
         if pii_cols:
             df = df.drop(*pii_cols)
-            logger.info("Attributes: dropped PII columns %s", pii_cols)
 
-        # sweep numeric-like strings (keep id/date as-is)
-        df = cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date", "Occupation"))
-        logger.info("Attributes transformations: cast_to_numeric applied.")
+        # numeric sweep
+        df = cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date"))
+        df = upcast_floats_to_double(df)
+
+        # Age cleaning: keep only [18, 85], else set to null
+        if "Age" in df.columns:
+            df = df.withColumn(
+                "age_clean",
+                F.when((F.col("Age") >= 18) & (F.col("Age") <= 85), F.col("Age").cast("int"))
+                 .otherwise(F.lit(None).cast("int"))
+            )
+
+        # as-of date
+        if "snapshot_date" in df.columns:
+            df = df.withColumn("asof_date", col("snapshot_date"))
+
+        # deduplicate at grain
+        keys = ["Customer_ID", "snapshot_date"]
+        order_cols = [c for c in ["updated_at", "snapshot_date"] if c in df.columns]
+        df = dedup_on(df, keys, order_cols=order_cols if order_cols else None)
+
         return df
+        
     except Exception as e:
         logger.error(f"Error in attributes transformation: {str(e)}")
         raise
 
 
-def transform_financials(df):
-    """
-    Financials:
-      1) numeric sweep via cast_to_numeric()
-      2) normalize Payment_Behaviour: garbage/unexpected -> 'Unknown'
-      3) parse Credit_History_Age (e.g., '10 Years and 9 Months') into:
-         - Credit_History_Age_Year (float, e.g., 10.75)
-         - Credit_History_Age_Month (int total months, e.g., 129)
-    """
-    try:
-        # 1) Cast numeric-like strings (protect known categoricals/text)
-        exclude = (
-            "Customer_ID",
-            "snapshot_date",
-            "Type_of_Loan",
-            "Credit_Mix",
-            "Payment_Behaviour",
-            "Credit_History_Age",
-        )
-        df = cast_to_numeric(df, exclude=exclude)
 
-        # 2) Normalize Payment_Behaviour to 'Unknown' if not in whitelist / garbage
+def transform_financials(df):
+    try:
+        # 1) numeric sweep (protect categoricals/text)
+        exclude = ("Customer_ID","snapshot_date","Type_of_Loan","Credit_Mix","Payment_Behaviour","Credit_History_Age")
+        df = cast_to_numeric(df, exclude=exclude)
+        df = upcast_floats_to_double(df)
+
+        # 2) normalize Payment_Behaviour -> 'Unknown'
         valid_behaviours = [
             "Low_spent_Small_value_payments",
             "High_spent_Medium_value_payments",
@@ -211,110 +238,124 @@ def transform_financials(df):
             "High_spent_Small_value_payments",
             "Low_spent_Large_value_payments",
         ]
-        bad_tokens = ["na", "n/a", "none", "null", "-", "?", "unknown", "undefined", "nan"]
-
-        raw_beh = F.trim(F.col("Payment_Behaviour"))
-        only_letters_underscores = F.regexp_replace(raw_beh, r"[^A-Za-z_]", "")
+        bad_tokens = ["na","n/a","none","null","-","?","unknown","undefined","nan"]
+        raw = F.trim(F.col("Payment_Behaviour"))
+        only_letters_underscores = F.regexp_replace(raw, r"[^A-Za-z_]", "")
         df = df.withColumn(
             "Payment_Behaviour",
             F.when(
-                raw_beh.isNull()
-                | (F.length(raw_beh) == 0)
-                | F.lower(raw_beh).isin(bad_tokens)
-                | (raw_beh != only_letters_underscores)
-                | (~raw_beh.isin(valid_behaviours)),
+                raw.isNull()
+                | (F.length(raw) == 0)
+                | F.lower(raw).isin(bad_tokens)
+                | (raw != only_letters_underscores)
+                | (~raw.isin(valid_behaviours)),
                 F.lit("Unknown"),
-            ).otherwise(raw_beh)
+            ).otherwise(raw)
         )
 
-        # 3) Parse Credit_History_Age -> years/months
-        #    Robust to singular/plural: "Year"/"Years", "Month"/"Months"
-        #    Example input: "10 Years and 9 Months"
-        cha_raw = F.col("Credit_History_Age")
-
-        years_str  = F.regexp_extract(cha_raw, r"(?i)(\d+)\s*year", 1)
-        months_str = F.regexp_extract(cha_raw, r"(?i)(\d+)\s*month", 1)
-
-        df = df.withColumn(
-            "__cha_years",
-            F.when(F.length(years_str) == 0, None).otherwise(years_str.cast(IntegerType()))
-        ).withColumn(
-            "__cha_months",
-            F.when(F.length(months_str) == 0, None).otherwise(months_str.cast(IntegerType()))
-        )
-
-        # compute outputs; if both parts missing -> null, else coalesce missing part to 0
-        has_any = F.col("__cha_years").isNotNull() | F.col("__cha_months").isNotNull()
-        yrs = F.coalesce(F.col("__cha_years"), F.lit(0))
-        mos = F.coalesce(F.col("__cha_months"), F.lit(0))
-
+        # 3) parse Credit_History_Age -> years/months
+        yrs  = F.regexp_extract(F.col("Credit_History_Age"), r"(?i)(\d+)\s*year", 1)
+        mos  = F.regexp_extract(F.col("Credit_History_Age"), r"(?i)(\d+)\s*month", 1)
+        yrsN = F.when(F.length(yrs)==0, None).otherwise(yrs.cast(IntegerType()))
+        mosN = F.when(F.length(mos)==0, None).otherwise(mos.cast(IntegerType()))
+        has_any = yrsN.isNotNull() | mosN.isNotNull()
+        yrsNZ = F.coalesce(yrsN, F.lit(0))
+        mosNZ = F.coalesce(mosN, F.lit(0))
         df = df.withColumn(
             "Credit_History_Age_Year",
-            F.when(
-                has_any,
-                yrs.cast(FloatType()) + (mos.cast(FloatType()) / F.lit(12.0))
-            ).otherwise(F.lit(None).cast(FloatType()))
+            F.when(has_any, yrsNZ.cast(DoubleType()) + mosNZ.cast(DoubleType())/F.lit(12.0)).otherwise(F.lit(None).cast(DoubleType()))
         ).withColumn(
             "Credit_History_Age_Month",
-            F.when(
-                has_any,
-                (yrs * F.lit(12) + mos)
-            ).otherwise(F.lit(None).cast(IntegerType()))
-        ).drop("__cha_years", "__cha_months")
+            F.when(has_any, yrsNZ*F.lit(12) + mosNZ).otherwise(F.lit(None).cast(IntegerType()))
+        )
 
-        logger.info("Financials transformations: numeric sweep + Payment_Behaviour normalized + Credit_History_Age parsed.")
+        # 4) DTI = Outstanding_Debt / Annual_Income
+        if all(c in df.columns for c in ["Outstanding_Debt","Annual_Income"]):
+            df = df.withColumn(
+                "DTI",
+                F.when((col("Annual_Income") > 0) & col("Outstanding_Debt").isNotNull(),
+                       col("Outstanding_Debt") / col("Annual_Income")
+                ).otherwise(None).cast(DoubleType())
+            )
+
+        # 5) multi-hot for Type_of_Loan
+        if "Type_of_Loan" in df.columns:
+            # normalize & split tokens (remove spaces then split by comma)
+            toks = F.split(F.regexp_replace(F.coalesce(col("Type_of_Loan"), F.lit("")), r"\s+", ""), ",")
+            loan_types = [
+                "AutoLoan","Credit-Builder","PersonalLoan","HomeEquity",
+                "Mortgage","StudentLoan","DebtConsolidation"
+            ]
+            for t in loan_types:
+                df = df.withColumn(f"loan_type__{t}", F.array_contains(toks, F.lit(t)).cast("int"))
+            # optional: count how many types per row
+            df = df.withColumn(
+                "loan_type_count",
+                sum([F.col(f"loan_type__{t}") for t in loan_types])
+            )
+
+        # 6) as-of date
+        if "snapshot_date" in df.columns:
+            df = df.withColumn("asof_date", col("snapshot_date"))
+
+        # 7) deduplicate at grain
+        keys = ["Customer_ID", "snapshot_date"]
+        order_cols = [c for c in ["updated_at", "snapshot_date"] if c in df.columns]
+        df = dedup_on(df, keys, order_cols=order_cols if order_cols else None)
+
+        logger.info("Financials: numeric sweep + behaviour cleanup + credit age parsed + DTI + loan multi-hot + dedup + asof.")
         return df
-
+        
     except Exception as e:
         logger.error(f"Error in financials transformation: {str(e)}")
         raise
         
 
 def transform_loan(df):
-    """
-    Loan: enforce id/date types, sweep numeric-like strings, then derive MOB/DPD.
-    """
     try:
-        # 1) Enforce key id/date types explicitly
+        # enforce key id/date types explicitly
         type_map = {
             "loan_id": StringType(),
             "Customer_ID": StringType(),
             "loan_start_date": DateType(),
             "snapshot_date": DateType(),
         }
-        for col_name, dtype in type_map.items():
-            if col_name in df.columns:
-                df = df.withColumn(col_name, col(col_name).cast(dtype))
+        for c, t in type_map.items():
+            if c in df.columns:
+                df = df.withColumn(c, col(c).cast(t))
 
-        # 2) Sweep numeric-like strings for the rest (exclude id/date)
+        # numeric sweep for all other numeric-like fields
         df = cast_to_numeric(df, exclude=("Customer_ID", "snapshot_date", "loan_id", "loan_start_date"))
+        df = upcast_floats_to_double(df)
 
-        # 3) Derived features (MOB, installments_missed, first_missed_date, DPD)
+        # derived: MOB (= installment_num), installments_missed, first_missed_date, DPD
         df = df.withColumn("mob", col("installment_num").cast(IntegerType()))
-
-        # Avoid divide-by-zero for due_amt
-        safe_due = when((col("due_amt").isNotNull()) & (col("due_amt") != 0), col("due_amt"))
+        safe_due = F.when((col("due_amt").isNotNull()) & (col("due_amt") != 0), col("due_amt"))
         inst_missed = F.ceil(col("overdue_amt") / safe_due)
-        df = df.withColumn(
-            "installments_missed",
-            when(inst_missed.isNotNull(), inst_missed).otherwise(0).cast(IntegerType())
-        )
-
+        df = df.withColumn("installments_missed", F.when(inst_missed.isNotNull(), inst_missed).otherwise(0).cast(IntegerType()))
         df = df.withColumn(
             "first_missed_date",
-            when(col("installments_missed") > 0,
-                 F.add_months(col("snapshot_date"), -1 * col("installments_missed"))
+            F.when(col("installments_missed") > 0,
+                   F.add_months(col("snapshot_date"), -1 * col("installments_missed"))
             ).cast(DateType())
         )
-
         df = df.withColumn(
             "dpd",
-            when(col("overdue_amt") > 0.0,
-                 F.datediff(col("snapshot_date"), col("first_missed_date"))
+            F.when(col("overdue_amt") > 0.0,
+                   F.datediff(col("snapshot_date"), col("first_missed_date"))
             ).otherwise(0).cast(IntegerType())
         )
 
-        logger.info("Loan transformations: cast_to_numeric applied; MOB/DPD computed.")
+        # as-of date
+        if "snapshot_date" in df.columns:
+            df = df.withColumn("asof_date", col("snapshot_date"))
+
+        # deduplicate at grain (loan_id + snapshot_date is typical)
+        keys = ["loan_id", "snapshot_date"] if "loan_id" in df.columns else ["Customer_ID", "snapshot_date"]
+        order_cols = [c for c in ["updated_at", "snapshot_date"] if c in df.columns]
+        df = dedup_on(df, keys, order_cols=order_cols if order_cols else None)
+
+        logger.info("Loan: types enforced + numeric sweep + MOB/DPD + dedup + asof.")
         return df
     except Exception as e:
         logger.error(f"Error in loan transformation: {str(e)}")
@@ -323,41 +364,6 @@ def transform_loan(df):
 # =============================================================================
 # PROCESSORS
 # =============================================================================
-def process_silver_loan_table(snapshot_date_str, bronze_directory, silver_directory, spark):
-    """
-    Load bronze loan CSV, apply transform_loan, save to silver parquet.
-    """
-    try:
-        table_name = "lms_loan_daily"
-        silver_dir = os.path.join(silver_directory, "loan_daily/")
-        if not os.path.exists(silver_dir):
-            os.makedirs(silver_dir)
-            logger.info(f"Created directory: {silver_dir}")
-
-        bronze_dir = os.path.join(bronze_directory, "lms_loan_daily/")
-        partition_name = f"bronze_lms_loan_daily_{snapshot_date_str.replace('-','_')}.csv"
-        filepath = os.path.join(bronze_dir, partition_name)
-
-        if not os.path.exists(filepath):
-            logger.warning(f"Bronze file not found: {filepath}")
-            return None
-
-        df = spark.read.csv(filepath, header=True, inferSchema=True)
-        logger.info(f"Loaded {table_name} from {filepath}: {df.count()} rows")
-
-        # Keep light sanity check only
-        validate_customer_ids(df, table_name)
-
-        df = transform_loan(df)
-
-        out_file = os.path.join(silver_dir, f"silver_loan_daily_{snapshot_date_str.replace('-','_')}.parquet")
-        df.write.mode("overwrite").parquet(out_file)
-        logger.info(f"Saved loan_daily to {out_file}")
-        return df
-    except Exception as e:
-        logger.error(f"Error processing loan table: {str(e)}")
-        raise
-
 
 def process_silver_clickstream_table(snapshot_date_str, bronze_directory, silver_directory, spark):
     """
@@ -423,6 +429,43 @@ def process_silver_financials_table(snapshot_date_str, bronze_directory, silver_
     except Exception as e:
         logger.error(f"Error processing financials table: {str(e)}")
         raise
+
+
+def process_silver_loan_table(snapshot_date_str, bronze_directory, silver_directory, spark):
+    """
+    Load bronze loan CSV, apply transform_loan, save to silver parquet.
+    """
+    try:
+        table_name = "lms_loan_daily"
+        silver_dir = os.path.join(silver_directory, "loan_daily/")
+        if not os.path.exists(silver_dir):
+            os.makedirs(silver_dir)
+            logger.info(f"Created directory: {silver_dir}")
+
+        bronze_dir = os.path.join(bronze_directory, "lms_loan_daily/")
+        partition_name = f"bronze_lms_loan_daily_{snapshot_date_str.replace('-','_')}.csv"
+        filepath = os.path.join(bronze_dir, partition_name)
+
+        if not os.path.exists(filepath):
+            logger.warning(f"Bronze file not found: {filepath}")
+            return None
+
+        df = spark.read.csv(filepath, header=True, inferSchema=True)
+        logger.info(f"Loaded {table_name} from {filepath}: {df.count()} rows")
+
+        # Keep light sanity check only
+        validate_customer_ids(df, table_name)
+
+        df = transform_loan(df)
+
+        out_file = os.path.join(silver_dir, f"silver_loan_daily_{snapshot_date_str.replace('-','_')}.parquet")
+        df.write.mode("overwrite").parquet(out_file)
+        logger.info(f"Saved loan_daily to {out_file}")
+        return df
+    except Exception as e:
+        logger.error(f"Error processing loan table: {str(e)}")
+        raise
+        
 
 # =============================================================================
 # ORCHESTRATION
